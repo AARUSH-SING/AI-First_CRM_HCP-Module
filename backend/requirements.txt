@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+langgraph
+langchain
+langchain-core
+langchain-groq
+sqlalchemy
+psycopg2-binary
+pymysql
+
