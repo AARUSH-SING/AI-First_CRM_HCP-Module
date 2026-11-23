@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, Optional
 
@@ -10,7 +11,7 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 
-from .schemas import ExtractionResult, InteractionForm
+from .schemas import ExtractionResult, ExtractedInteraction, InteractionForm, Sentiment, InteractionType
 
 # Groq retired `gemma2-9b-it` (see https://console.groq.com/docs/deprecations).
 # Default: strong general + tool use. Override with GROQ_MODEL, e.g. `llama-3.1-8b-instant`
@@ -196,44 +197,184 @@ def build_langgraph_agent():
     return create_react_agent(llm, tools)
 
 
+def heuristic_extract_interaction(
+    message: str, current_form: InteractionForm, error_reason: str = ""
+) -> dict[str, Any]:
+    """
+    Fallback extractor for local testing, offline demo, or when GROQ_API_KEY is unset/invalid.
+    Extracts key HCP interaction entities and normalizes fields safely.
+    """
+    extracted: dict[str, Any] = {}
+    lowered = message.lower()
+
+    # 1. HCP Name: e.g. "Dr. Smith", "Dr Jane Doe", "Doctor Watson"
+    hcp_match = re.search(
+        r"\b(?:Dr\.|Doctor|Dr)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", message
+    )
+    if hcp_match:
+        extracted["hcpName"] = f"Dr. {hcp_match.group(1).replace('Dr. ', '')}"
+
+    # 2. Interaction Type
+    if "call" in lowered or "phone" in lowered:
+        extracted["interactionType"] = "Call"
+    elif "virtual" in lowered or "zoom" in lowered or "teams" in lowered:
+        extracted["interactionType"] = "Virtual"
+    elif "email" in lowered:
+        extracted["interactionType"] = "Email"
+    elif any(k in lowered for k in ["met", "meeting", "visited", "in-person", "clinic", "office"]):
+        extracted["interactionType"] = "Meeting"
+
+    # 3. Sentiment
+    if any(k in lowered for k in ["positive", "receptive", "enthusiastic", "great", "interested", "promising"]):
+        extracted["sentiment"] = "positive"
+    elif any(k in lowered for k in ["negative", "hesitant", "skeptical", "unhappy", "reluctant", "unfavorable"]):
+        extracted["sentiment"] = "negative"
+    elif "neutral" in lowered:
+        extracted["sentiment"] = "neutral"
+
+    # 4. Materials Shared
+    materials = list(current_form.materialsShared)
+    standard_materials = [
+        "Product Brochure",
+        "Clinical Reprint",
+        "Dosing Guide",
+        "Slide Deck",
+        "Safety Data Sheet",
+        "Product Monograph",
+    ]
+    for mat in standard_materials:
+        if mat.lower() in lowered and mat not in materials:
+            materials.append(mat)
+    # Check general material terms if none matched
+    if "brochure" in lowered and not any("brochure" in m.lower() for m in materials):
+        materials.append("Product Brochure")
+    if "dosing" in lowered and not any("dosing" in m.lower() for m in materials):
+        materials.append("Dosing Guide")
+    if "reprint" in lowered and not any("reprint" in m.lower() for m in materials):
+        materials.append("Clinical Study Reprint")
+    if materials:
+        extracted["materialsShared"] = materials
+
+    # 5. Samples Distributed
+    samples = list(current_form.samplesDistributed)
+    sample_patterns = [
+        r"sample[s]?\s*(?:of)?\s*([A-Za-z0-9\s]+(?:mg|pack|starter pack))",
+        r"([A-Za-z0-9\s]+(?:mg|starter pack)\s*samples?)",
+    ]
+    for pat in sample_patterns:
+        for match in re.findall(pat, message, re.IGNORECASE):
+            val = (match if isinstance(match, str) else match[0]).strip()
+            if val and not any(val.lower() in s.lower() for s in samples):
+                samples.append(val)
+    if "sample" in lowered and not samples:
+        samples.append("Starter Sample Pack")
+    if samples:
+        extracted["samplesDistributed"] = samples
+
+    # 6. Topics Discussed
+    topic_match = re.search(
+        r"(?:discussed|reviewed|talked about|covered|focused on)\s+([^.,;\n]+)",
+        message,
+        re.IGNORECASE,
+    )
+    if topic_match:
+        extracted["topicsDiscussed"] = topic_match.group(1).strip()
+    elif len(message.split()) > 3:
+        extracted["topicsDiscussed"] = message.strip()
+
+    # 7. Outcomes
+    outcome_match = re.search(
+        r"(?:agreed to|agreed that|outcome:|decided to|requested)\s+([^.,;\n]+)",
+        message,
+        re.IGNORECASE,
+    )
+    if outcome_match:
+        extracted["outcomes"] = f"HCP {outcome_match.group(0).strip()}."
+
+    # 8. Follow-up Actions
+    followup_match = re.search(
+        r"(?:follow[\s-]?up:?|action:?|next step:?)\s*([^.,;\n]+)",
+        message,
+        re.IGNORECASE,
+    )
+    if followup_match:
+        extracted["followUpActions"] = followup_match.group(1).strip()
+
+    follow_ups = [
+        "Schedule follow-up discussion in 2 weeks",
+        "Share relevant clinical study data and dosing guidelines",
+        "Confirm delivery and receipt of requested product samples",
+    ]
+
+    hcp_disp = extracted.get("hcpName") or current_form.hcpName or "the HCP"
+    note_info = (
+        f" ({error_reason})"
+        if error_reason
+        else " (Offline mode: configure GROQ_API_KEY in .env for full LangGraph agent reasoning)"
+    )
+    summary = f"Captured interaction with {hcp_disp}.{note_info}"
+
+    return {
+        "extracted": extracted,
+        "summary": summary,
+        "suggestedFollowUps": follow_ups,
+    }
+
+
 def run_log_interaction_via_langgraph(message: str, current_form: InteractionForm) -> dict[str, Any]:
     """
     Run the LangGraph tool-calling agent and return the log_interaction tool output.
+    Falls back gracefully to heuristic entity extraction if GROQ_API_KEY is not set or if the LLM call fails.
     """
-    agent = build_langgraph_agent()
-
-    system = SystemMessage(
-        content=(
-            "You are an AI assistant for life-sciences field reps logging HCP interactions. "
-            "Always call the `log_interaction` tool when the user provides an interaction description. "
-            "After calling tools, keep the final assistant message short."
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key or api_key.startswith("YOUR_"):
+        return heuristic_extract_interaction(
+            message=message,
+            current_form=current_form,
+            error_reason="Set GROQ_API_KEY in repo root .env to enable Groq LangGraph agent",
         )
-    )
 
-    human = HumanMessage(
-        content=(
-            "Log this interaction into structured fields.\n\n"
-            f"NOTE:\n{message}\n\n"
-            "CURRENT_FORM_JSON:\n"
-            f"{current_form.model_dump_json()}\n\n"
-            "Use the `log_interaction` tool with:\n"
-            f'- note="{message}"\n'
-            f"- current_form_json=<CURRENT_FORM_JSON above>\n"
+    try:
+        agent = build_langgraph_agent()
+
+        system = SystemMessage(
+            content=(
+                "You are an AI assistant for life-sciences field reps logging HCP interactions. "
+                "Always call the `log_interaction` tool when the user provides an interaction description. "
+                "After calling tools, keep the final assistant message short."
+            )
         )
-    )
 
-    out = agent.invoke({"messages": [system, human]})
-    messages = out.get("messages", [])
+        human = HumanMessage(
+            content=(
+                "Log this interaction into structured fields.\n\n"
+                f"NOTE:\n{message}\n\n"
+                "CURRENT_FORM_JSON:\n"
+                f"{current_form.model_dump_json()}\n\n"
+                "Use the `log_interaction` tool with:\n"
+                f'- note="{message}"\n'
+                f"- current_form_json=<CURRENT_FORM_JSON above>\n"
+            )
+        )
 
-    tool_payload: Optional[str] = None
-    for m in reversed(messages):
-        if getattr(m, "type", None) == "tool" and getattr(m, "name", None) == "log_interaction":
-            tool_payload = getattr(m, "content", None)
-            break
+        out = agent.invoke({"messages": [system, human]})
+        messages = out.get("messages", [])
 
-    if not tool_payload:
-        raise RuntimeError("Agent did not call log_interaction tool as expected.")
+        tool_payload: Optional[str] = None
+        for m in reversed(messages):
+            if getattr(m, "type", None) == "tool" and getattr(m, "name", None) == "log_interaction":
+                tool_payload = getattr(m, "content", None)
+                break
 
-    parsed = json.loads(tool_payload)
-    return parsed
+        if not tool_payload:
+            raise RuntimeError("Agent did not call log_interaction tool as expected.")
+
+        parsed = json.loads(tool_payload)
+        return parsed
+    except Exception as e:
+        return heuristic_extract_interaction(
+            message=message,
+            current_form=current_form,
+            error_reason=f"Groq LLM call failed ({e}); used heuristic fallback",
+        )
 

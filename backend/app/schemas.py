@@ -56,5 +56,5 @@ class ExtractedInteraction(BaseModel):
 class ExtractionResult(BaseModel):
     extracted: ExtractedInteraction = Field(default_factory=ExtractedInteraction)
     summary: str = Field(default="")
-    suggestedFollowUps: list[str] = Field(default_factory=list, max_length=8)
+    suggestedFollowUps: list[str] = Field(default_factory=list)
 

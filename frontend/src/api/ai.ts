@@ -11,8 +11,10 @@ export type AiLogResponse = {
   suggestedFollowUps: string[]
 }
 
+const API_BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL ?? (import.meta.env.PROD ? '' : 'http://localhost:8000')
+
 export async function aiLogInteraction(payload: AiLogRequest): Promise<AiLogResponse> {
-  const res = await fetch('http://localhost:8000/ai/log-interaction', {
+  const res = await fetch(`${API_BASE_URL}/ai/log-interaction`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

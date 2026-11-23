@@ -248,18 +248,20 @@ export default function App() {
                   <Button
                     variant="text"
                     startIcon={<Summarize />}
-                    onClick={() =>
+                    onClick={() => {
+                      const sampleNote = 'Met Dr. Robert Chen at Cardiology clinic. Discussed Product X clinical study results and dosing guide. Positive reaction, requested 10mg starter pack samples and clinical reprint.'
+                      setChatInput(sampleNote)
                       setChatHistory((h) => [
                         ...h,
                         {
                           role: 'assistant',
                           text:
-                            'Voice note summarization is mocked in this UI. In production, this would require explicit consent capture and an audio → text → LLM pipeline.',
+                            'Loaded a sample voice-transcribed interaction note into your input box below. Click "Log" or press Enter to test extraction!',
                         },
                       ])
-                    }
+                    }}
                   >
-                    Summarize from Voice Note (Requires Consent)
+                    Sample Voice Note Transcription (Try Demo)
                   </Button>
                 </Box>
               </Box>
